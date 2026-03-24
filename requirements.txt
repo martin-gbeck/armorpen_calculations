@@ -1,5 +1,6 @@
+# Working combination
 streamlit==1.25.0
+altair==5.0.1
 plotly==6.6.0
 pandas
 numpy
-altair==6.0.0
