@@ -408,7 +408,7 @@ def render_sidebar_controls() -> np.ndarray:
             )
             lethality_expression = st.text_input(
                 "Lethality",
-                value="18 + 20 + 10",
+                value="2*18 + 15",
                 help="Arithmetic is allowed. Example: 18 + 20 + 10 becomes 48.",
             )
             submitted = st.form_submit_button("Add Row", use_container_width=True)
