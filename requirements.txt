@@ -1,4 +1,5 @@
-plotly
+streamlit==1.25.0
+plotly==6.6.0
 pandas
 numpy
-streamlit
+altair==6.0.0
