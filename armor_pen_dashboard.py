@@ -16,9 +16,11 @@ import streamlit as st
 DEFAULT_ARMOR_INTERVAL = 25
 DEFAULT_ARMOR_MIN = 75
 DEFAULT_ARMOR_MAX = 300
+COMPARISON_BASE_ARMOR = 200.0
 TABLE_VIEWS = {
-    "Armor After Penetration": "effective_armor",
+    "Efficient HP Multiplier": "ehp_multiplier",
     "Damage Reduction (%)": "damage_reduction",
+    "Armor After Penetration": "effective_armor",
 }
 ALLOWED_OPERATORS = {
     ast.Add: operator.add,
@@ -51,6 +53,24 @@ def damage_reduction_percent(armor: np.ndarray | float) -> np.ndarray:
     return armor_array / (100.0 + armor_array) * 100.0
 
 
+def effective_hp_multiplier(armor: np.ndarray | float) -> np.ndarray:
+    """Effective HP multiplier, equal to 1 / (1 - r) for damage reduction r."""
+    armor_array = np.asarray(armor, dtype=float)
+    return 1.0 + armor_array / 100.0
+
+
+def damage_increase_percent(
+    first_effective_armor: np.ndarray | float,
+    second_effective_armor: np.ndarray | float,
+) -> np.ndarray:
+    """Relative damage gain from moving from the first effective armor to the second."""
+    first_armor = np.asarray(first_effective_armor, dtype=float)
+    second_armor = np.asarray(second_effective_armor, dtype=float)
+    first_multiplier = 100.0 / (100.0 + first_armor)
+    second_multiplier = 100.0 / (100.0 + second_armor)
+    return (second_multiplier / first_multiplier - 1.0) * 100.0
+
+
 def true_damage_threshold(armor_pen_pct: float, lethality: float) -> float:
     """Return the highest armor value that still becomes 0 effective armor."""
     remaining_fraction = 1.0 - armor_pen_pct / 100.0
@@ -79,14 +99,16 @@ def format_threshold_value(value: float) -> str:
 
 def safe_eval_math(expression: str) -> float:
     """Evaluate simple arithmetic expressions safely."""
+    normalized = expression.strip()
+    normalized = normalized.replace("×", "*").replace("÷", "/")
+    normalized = normalized.replace("−", "-").replace("–", "-").replace("—", "-")
+    normalized = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", "*", normalized)
 
     def _eval(node: ast.AST) -> float:
         if isinstance(node, ast.Expression):
             return _eval(node.body)
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
             return float(node.value)
-        if isinstance(node, ast.Num):
-            return float(node.n)
         if isinstance(node, ast.BinOp) and type(node.op) in ALLOWED_OPERATORS:
             try:
                 return ALLOWED_OPERATORS[type(node.op)](_eval(node.left), _eval(node.right))
@@ -96,11 +118,11 @@ def safe_eval_math(expression: str) -> float:
             return ALLOWED_OPERATORS[type(node.op)](_eval(node.operand))
         raise ValueError("Only numbers and + - * / ( ) are allowed.")
 
-    if not expression.strip():
+    if not normalized:
         raise ValueError("Enter a value.")
 
     try:
-        tree = ast.parse(expression, mode="eval")
+        tree = ast.parse(normalized, mode="eval")
     except SyntaxError as exc:
         raise ValueError("Invalid math expression.") from exc
 
@@ -143,6 +165,7 @@ def init_state() -> None:
     st.session_state.setdefault("next_row_id", 1)
     st.session_state.setdefault("compare_first_id", None)
     st.session_state.setdefault("compare_second_id", None)
+    st.session_state.setdefault("selected_metric_label", "Efficient HP Multiplier")
 
 
 def armor_columns(min_armor: int, max_armor: int, interval: int) -> np.ndarray:
@@ -183,7 +206,18 @@ def selected_rows_from_state() -> list[dict[str, Any]]:
     if first_id not in row_lookup or second_id not in row_lookup:
         return []
 
-    return [row_lookup[first_id], row_lookup[second_id]]
+    first_row = row_lookup[first_id]
+    second_row = row_lookup[second_id]
+    first_damage_gain = float(
+        damage_increase_percent(
+            effective_armor(COMPARISON_BASE_ARMOR, first_row["armor_pen_pct"], first_row["lethality"]),
+            effective_armor(COMPARISON_BASE_ARMOR, second_row["armor_pen_pct"], second_row["lethality"]),
+        )
+    )
+    if first_damage_gain < 0:
+        return [second_row, first_row]
+
+    return [first_row, second_row]
 
 
 def metric_values(row: dict[str, Any], armor_values: np.ndarray) -> dict[str, np.ndarray]:
@@ -191,14 +225,16 @@ def metric_values(row: dict[str, Any], armor_values: np.ndarray) -> dict[str, np
     return {
         "effective_armor": effective,
         "damage_reduction": damage_reduction_percent(effective),
+        "ehp_multiplier": effective_hp_multiplier(effective),
     }
 
 
 def format_table_value(value: float, table_key: str) -> str:
-    rounded = f"{value:.0f}"
     if table_key == "damage_reduction":
-        return f"{rounded}%"
-    return rounded
+        return f"{value:.0f}%"
+    if table_key == "ehp_multiplier":
+        return f"{value:.2f}x"
+    return f"{value:.0f}"
 
 
 def build_metric_table(
@@ -220,23 +256,6 @@ def build_metric_table(
     return pd.DataFrame(records).set_index(table_label)
 
 
-def build_delta_table(
-    first_row: dict[str, Any],
-    second_row: dict[str, Any],
-    armor_values: np.ndarray,
-    table_key: str,
-    table_label: str,
-) -> pd.DataFrame:
-    first_values = metric_values(first_row, armor_values)[table_key]
-    second_values = metric_values(second_row, armor_values)[table_key]
-    record = {table_label: f"Delta ({second_row['label']} - {first_row['label']})"}
-
-    for armor_value, delta in zip(armor_values, second_values - first_values):
-        record[str(int(armor_value))] = format_table_value(float(delta), table_key)
-
-    return pd.DataFrame([record]).set_index(table_label)
-
-
 def build_selected_rows_table(
     first_row: dict[str, Any],
     second_row: dict[str, Any],
@@ -245,19 +264,29 @@ def build_selected_rows_table(
     table_label: str,
 ) -> pd.DataFrame:
     armor_headers = [str(int(value)) for value in armor_values]
-    first_values = metric_values(first_row, armor_values)[table_key]
-    second_values = metric_values(second_row, armor_values)[table_key]
+    first_metrics = metric_values(first_row, armor_values)
+    second_metrics = metric_values(second_row, armor_values)
+    first_values = first_metrics[table_key]
+    second_values = second_metrics[table_key]
     delta_values = second_values - first_values
+    damage_gain_values = damage_increase_percent(
+        first_metrics["effective_armor"],
+        second_metrics["effective_armor"],
+    )
 
     records = []
     for row_label, values in (
         (first_row["label"], first_values),
         (second_row["label"], second_values),
         ("Delta", delta_values),
+        ("Damage Increase", damage_gain_values),
     ):
         record = {table_label: row_label}
         for header, value in zip(armor_headers, values):
-            record[header] = format_table_value(float(value), table_key)
+            if row_label == "Damage Increase":
+                record[header] = f"{float(value):.1f}%"
+            else:
+                record[header] = format_table_value(float(value), table_key)
         records.append(record)
 
     return pd.DataFrame(records).set_index(table_label)
@@ -287,8 +316,15 @@ def build_combined_plot(
     table_label: str,
     table_key: str,
 ) -> go.Figure:
-    text_template = "%{y:.2f}%" if table_key == "damage_reduction" else "%{y:.2f}"
-    y_title = "Damage reduction (%)" if table_key == "damage_reduction" else "Armor after penetration"
+    if table_key == "damage_reduction":
+        text_template = "%{y:.2f}%"
+        y_title = "Damage reduction (%)"
+    elif table_key == "ehp_multiplier":
+        text_template = "%{y:.2f}x"
+        y_title = "Effective HP multiplier"
+    else:
+        text_template = "%{y:.2f}"
+        y_title = "Armor after penetration"
 
     fig = go.Figure()
     for row in rows:
@@ -332,23 +368,30 @@ def build_combined_plot(
     return fig
 
 
-def build_effective_armor_plot(rows: list[dict[str, Any]], armor_values: np.ndarray) -> go.Figure:
+def build_damage_increase_plot(
+    first_row: dict[str, Any],
+    second_row: dict[str, Any],
+    armor_values: np.ndarray,
+) -> go.Figure:
+    first_effective_armor = metric_values(first_row, armor_values)["effective_armor"]
+    second_effective_armor = metric_values(second_row, armor_values)["effective_armor"]
+    damage_gain = damage_increase_percent(first_effective_armor, second_effective_armor)
+
     fig = go.Figure()
-    for row in rows:
-        row_metrics = metric_values(row, armor_values)
-        fig.add_trace(
-            go.Scatter(
-                x=armor_values,
-                y=row_metrics["effective_armor"],
-                mode="lines+markers",
-                name=row["label"],
-                marker={"size": 8},
-                line={"width": 3},
-                hovertemplate=(
-                    f"{row['label']}<br>Armor: %{{x:.0f}}<br>Effective armor: %{{y:.2f}}<extra></extra>"
-                ),
-            )
+    fig.add_trace(
+        go.Scatter(
+            x=armor_values,
+            y=damage_gain,
+            mode="lines+markers",
+            name=f"{second_row['label']} vs {first_row['label']}",
+            marker={"size": 8},
+            line={"width": 3},
+            hovertemplate=(
+                f"{second_row['label']} vs {first_row['label']}"
+                "<br>Armor: %{x:.0f}<br>Damage increase: %{y:.2f}%<extra></extra>"
+            ),
         )
+    )
 
     for armor_value in armor_values:
         fig.add_vline(
@@ -359,7 +402,7 @@ def build_effective_armor_plot(rows: list[dict[str, Any]], armor_values: np.ndar
         )
 
     fig.update_layout(
-        title="Effective Armor",
+        title="Damage Increase From Added Armor Pen",
         template="plotly_white",
         height=500,
         xaxis={
@@ -368,10 +411,9 @@ def build_effective_armor_plot(rows: list[dict[str, Any]], armor_values: np.ndar
             "tickvals": armor_values,
             "ticktext": [str(int(value)) for value in armor_values],
         },
-        yaxis={"title": "Effective armor", "rangemode": "tozero"},
+        yaxis={"title": "Damage increase (%)"},
         margin={"l": 40, "r": 20, "t": 55, "b": 40},
-        legend={"title": "Combo"},
-        showlegend=True,
+        showlegend=False,
     )
     return fig
 
@@ -497,7 +539,12 @@ def render_table_section(
     selected_rows: list[dict[str, Any]],
 ) -> tuple[str, str]:
     st.subheader("All Rows")
-    table_label = st.radio("Metric", list(TABLE_VIEWS.keys()), horizontal=True)
+    table_label = st.radio(
+        "Metric",
+        list(TABLE_VIEWS.keys()),
+        key="selected_metric_label",
+        horizontal=True,
+    )
     table_key = TABLE_VIEWS[table_label]
 
     if not st.session_state.rows:
@@ -527,13 +574,14 @@ def render_graphs(armor_values: np.ndarray, table_label: str, table_key: str, se
         build_combined_plot(rows_to_plot, armor_values, table_label, table_key),
         use_container_width=True,
     )
+    if len(selected_rows) == 2:
+        st.subheader("Damage Increase")
+        st.plotly_chart(
+            build_damage_increase_plot(selected_rows[0], selected_rows[1], armor_values),
+            use_container_width=True,
+        )
     st.subheader("Armor Reference")
     st.dataframe(build_armor_reference_table(armor_values), use_container_width=True)
-    st.subheader("Effective Armor")
-    st.plotly_chart(
-        build_effective_armor_plot(rows_to_plot, armor_values),
-        use_container_width=True,
-    )
 
 
 def main() -> None:
