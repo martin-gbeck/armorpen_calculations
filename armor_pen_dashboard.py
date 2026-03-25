@@ -418,6 +418,143 @@ def build_damage_increase_plot(
     return fig
 
 
+def build_quick_calculator_table(
+    target_armors: list[float],
+    current_pen_pct: float,
+    current_flat_pen: float,
+    added_pen_pct: float,
+    added_flat_pen: float,
+) -> pd.DataFrame:
+    armor_values = np.asarray(target_armors, dtype=float)
+    after_pen_pct = combine_penetration_percent(current_pen_pct, added_pen_pct)
+    after_flat_pen = current_flat_pen + added_flat_pen
+
+    before_effective = effective_armor(armor_values, current_pen_pct, current_flat_pen)
+    after_effective = effective_armor(armor_values, after_pen_pct, after_flat_pen)
+    before_reduction = damage_reduction_percent(before_effective)
+    after_reduction = damage_reduction_percent(after_effective)
+    before_damage = 100.0 / (100.0 + before_effective) * 100.0
+    after_damage = 100.0 / (100.0 + after_effective) * 100.0
+    added_damage = damage_increase_percent(before_effective, after_effective)
+
+    column_labels = [
+        f"Target {index} ({format_compact_number(armor)})"
+        for index, armor in enumerate(target_armors, start=1)
+    ]
+    table = pd.DataFrame(
+        {
+            column_label: [
+                format_compact_number(float(armor)),
+                format_compact_number(float(before_armor)),
+                format_compact_number(float(after_armor)),
+                f"{float(before_dr):.1f}%",
+                f"{float(after_dr):.1f}%",
+                f"{float(before_damage_pct):.1f}%",
+                f"{float(after_damage_pct):.1f}%",
+                f"{float(damage_gain):.1f}%",
+            ]
+            for column_label, armor, before_armor, after_armor, before_dr, after_dr, before_damage_pct, after_damage_pct, damage_gain in zip(
+                column_labels,
+                target_armors,
+                before_effective,
+                after_effective,
+                before_reduction,
+                after_reduction,
+                before_damage,
+                after_damage,
+                added_damage,
+            )
+        },
+        index=[
+            "Base armor",
+            "Before effective armor",
+            "After effective armor",
+            "Before damage reduction",
+            "After damage reduction",
+            "Before damage dealt",
+            "After damage dealt",
+            "Added damage",
+        ],
+    )
+    return table
+
+
+def build_quick_damage_increase_summary(
+    target_armors: list[float],
+    current_pen_pct: float,
+    current_flat_pen: float,
+    added_pen_pct: float,
+    added_flat_pen: float,
+) -> pd.DataFrame:
+    armor_values = np.asarray(target_armors, dtype=float)
+    after_pen_pct = combine_penetration_percent(current_pen_pct, added_pen_pct)
+    after_flat_pen = current_flat_pen + added_flat_pen
+    before_effective = effective_armor(armor_values, current_pen_pct, current_flat_pen)
+    after_effective = effective_armor(armor_values, after_pen_pct, after_flat_pen)
+    added_damage = damage_increase_percent(before_effective, after_effective)
+
+    return pd.DataFrame(
+        {
+            f"Target {index} ({format_compact_number(float(armor))} armor)": [
+                f"{float(damage_gain):.1f}%",
+            ]
+            for index, (armor, damage_gain) in enumerate(zip(target_armors, added_damage), start=1)
+        },
+        index=["Damage Increase"],
+    )
+
+
+def render_centered_summary_table(summary_table: pd.DataFrame) -> None:
+    headers = "".join(f"<th>{column}</th>" for column in summary_table.columns)
+    rows = "".join(
+        "<tr>"
+        + f"<th>{row_label}</th>"
+        + "".join(f"<td>{value}</td>" for value in row_values)
+        + "</tr>"
+        for row_label, row_values in zip(summary_table.index, summary_table.values.tolist())
+    )
+    st.markdown(
+        f"""
+        <style>
+        .quick-summary-table {{
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            margin: 0.25rem 0 1rem 0;
+        }}
+        .quick-summary-table th,
+        .quick-summary-table td {{
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            padding: 0.75rem;
+            text-align: center;
+            vertical-align: middle;
+        }}
+        .quick-summary-table thead th {{
+            background: rgba(49, 51, 63, 0.06);
+            font-weight: 600;
+        }}
+        .quick-summary-table tbody th {{
+            background: rgba(49, 51, 63, 0.04);
+            font-weight: 600;
+            white-space: nowrap;
+        }}
+        </style>
+        <table class="quick-summary-table">
+            <thead>
+                <tr>
+                    <th></th>
+                    {headers}
+                </tr>
+            </thead>
+            <tbody>
+                {rows}
+            </tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_sidebar_controls() -> np.ndarray:
     with st.sidebar:
         st.subheader("Armor Columns")
@@ -584,15 +721,7 @@ def render_graphs(armor_values: np.ndarray, table_label: str, table_key: str, se
     st.dataframe(build_armor_reference_table(armor_values), use_container_width=True)
 
 
-def main() -> None:
-    st.set_page_config(page_title="Armor Pen Table Calculator", layout="wide")
-    init_state()
-
-    st.title("Armor Pen Table Calculator")
-    st.caption(
-        "Build rows from armor pen and lethality combos, then switch the table between armor after penetration and damage reduction."
-    )
-
+def render_dashboard_tab() -> None:
     armor_values = render_sidebar_controls()
     selected_rows = selected_rows_from_state()
 
@@ -606,6 +735,81 @@ def main() -> None:
         table_label, table_key = render_table_section(armor_values, selected_rows)
 
     render_graphs(armor_values, table_label, table_key, selected_rows)
+
+
+def render_quick_calculator_tab() -> None:
+    st.subheader("Quick Calculator")
+    st.caption("Compare your current penetration against a potential added pen upgrade across up to five targets.")
+
+    default_target_armors = [75.0, 100.0, 150.0, 200.0, 250.0]
+    target_columns = st.columns(5)
+    target_armors: list[float] = []
+    for index, column in enumerate(target_columns, start=1):
+        with column:
+            target_armors.append(
+                float(
+                    st.number_input(
+                    f"Target {index} armor",
+                    key=f"quick_target_armor_{index}",
+                    min_value=0.0,
+                    value=default_target_armors[index - 1],
+                    step=1.0,
+                )
+                )
+            )
+
+    input_columns = st.columns(4)
+    with input_columns[0]:
+        current_pen_pct = float(
+            st.number_input("Current pen %", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
+        )
+    with input_columns[1]:
+        current_flat_pen = float(st.number_input("Current flat pen", min_value=0.0, value=0.0, step=1.0))
+    with input_columns[2]:
+        added_pen_pct = float(st.number_input("Added pen %", min_value=0.0, max_value=100.0, value=35.0, step=1.0))
+    with input_columns[3]:
+        added_flat_pen = float(st.number_input("Added flat pen", min_value=0.0, value=0.0, step=1.0))
+
+    after_pen_pct = combine_penetration_percent(current_pen_pct, added_pen_pct)
+    after_flat_pen = current_flat_pen + added_flat_pen
+    st.caption(
+        f"Before: {format_compact_number(current_pen_pct)}% + {format_compact_number(current_flat_pen)} | After: {format_compact_number(after_pen_pct)}% + {format_compact_number(after_flat_pen)}"
+    )
+    quick_summary = build_quick_damage_increase_summary(
+        target_armors,
+        current_pen_pct,
+        current_flat_pen,
+        added_pen_pct,
+        added_flat_pen,
+    )
+    render_centered_summary_table(quick_summary)
+    with st.expander("Detailed breakdown"):
+        st.dataframe(
+            build_quick_calculator_table(
+                target_armors,
+                current_pen_pct,
+                current_flat_pen,
+                added_pen_pct,
+                added_flat_pen,
+            ),
+            use_container_width=True,
+        )
+
+
+def main() -> None:
+    st.set_page_config(page_title="Armor Pen Table Calculator", layout="wide")
+    init_state()
+
+    st.title("Armor Pen Table Calculator")
+    st.caption(
+        "Build rows from armor pen and lethality combos, then switch the table between armor after penetration and damage reduction."
+    )
+
+    quick_calculator_tab, dashboard_tab = st.tabs(["Quick Calculator", "Dashboard"])
+    with quick_calculator_tab:
+        render_quick_calculator_tab()
+    with dashboard_tab:
+        render_dashboard_tab()
 
 
 if __name__ == "__main__":
